@@ -218,7 +218,7 @@ table.tbl textarea{min-height:36px}
    ════════════════════════════════════════════════════════════════════════ */
 window.APP_CONFIG = window.APP_CONFIG || {
   backend: "firebase",
-  version: "1.1.0",
+  version: "1.1.1",
   ente: "Regione Molise",
   struttura: "Direzione Generale della Giunta Regionale - Servizio di Supporto al Direttore Generale",
   ufficio: "Ufficio Programmazione strategica - Performance organizzativa - Coordinamento controlli interni - Controllo Strategico",
@@ -655,7 +655,7 @@ window.DECLARATORIE={"PR.PN.02":{"rif":"A.1","titolo":"SERVIZIO DI GABINETTO DEL
       if(DB.mode==="firebase"){
         var cred=await FB.auth.signInWithEmailAndPassword(email,pwd);
         var u=await AUTH._fbProfile(cred.user);
-        if(!u) throw new Error("Utente autenticato ma non abilitato: chiedere all'amministratore di completare il profilo.");
+        if(!u) throw new Error(AUTH._msgPermessi(cred.user,"profilo assente nella raccolta «utenti»"));
         if(u.attivo===false) throw new Error("Utenza disattivata.");
         AUTH.user=u; FB.watch(u); AUTH._touch(u); return u;
       }
@@ -668,12 +668,21 @@ window.DECLARATORIE={"PR.PN.02":{"rif":"A.1","titolo":"SERVIZIO DI GABINETTO DEL
       AUTH._touch(u2); return u2;
     },
     async _fbProfile(fbUser){
-      var ref=FB.col("users").doc(fbUser.uid); var snap=await ref.get();
+      // L'account di Firebase Authentication dice CHI è l'utente; il profilo nella
+      // raccolta "utenti" (id del documento = UID) dice COSA può fare. Senza profilo
+      // le regole di sicurezza negano ogni lettura.
+      var ref=FB.col("users").doc(fbUser.uid), snap=null;
+      try{ snap=await ref.get() }catch(e){ throw new Error(AUTH._msgPermessi(fbUser,"lettura del profilo negata")) }
       if(snap.exists) return Object.assign({id:snap.id},snap.data());
-      // primo accesso assoluto: se non esistono profili, chi entra diventa amministratore
-      var any=await FB.col("users").limit(1).get();
-      if(any.empty){ var p={id:fbUser.uid,nome:fbUser.displayName||fbUser.email,email:fbUser.email,ruolo:"admin",servizi:[],attivo:true,createdAt:nowIso()}; await ref.set(p); return p }
+      // primo accesso assoluto: se la raccolta è vuota, chi entra diventa amministratore
+      var any=null; try{ any=await FB.col("users").limit(1).get() }catch(e){ any=null }
+      if(any&&any.empty){ var p={id:fbUser.uid,nome:fbUser.displayName||fbUser.email,email:fbUser.email,ruolo:"admin",servizi:[],attivo:true,createdAt:nowIso()}; try{ await ref.set(p); return p }catch(e){ throw new Error(AUTH._msgPermessi(fbUser,"creazione del profilo iniziale negata")) } }
       return null;
+    },
+    _msgPermessi(fbUser,dettaglio){
+      return "Accesso effettuato come "+fbUser.email+", ma l'utenza non risulta abilitata sulla piattaforma ("+dettaglio+"). "+
+        "Occorre un documento nella raccolta «utenti» di Firestore con identificativo uguale all'UID dell'account: "+fbUser.uid+
+        ". L'amministratore può crearlo dalla sezione Utenti della piattaforma oppure a mano dalla console Firebase.";
     },
     async spAutoLogin(){
       if(DB.mode!=="sharepoint"||!C.sharepoint.autoLoginConSharePoint) return null;
@@ -1656,11 +1665,12 @@ function Utenti(p){
   var openNew=function(){setM({nome:"",email:"",ruolo:"utente",servizi:[],attivo:true});setPwd("");setErr("")};
   var salva=async function(){setErr("");try{ if(m.id){await AUTH.updateUser(m); if(pwd){await AUTH.setPassword(m.id,pwd)} toast("Utente aggiornato")} else {await AUTH.createUser(m,pwd); toast("Utente creato")} setM(null) }catch(e){setErr(e.message)}};
   return h("div",null,h("div",{className:"card"},h("div",{className:"card-h"},h("h2",null,"Utenti e ruoli"),h("span",{className:"spacer"}),h(Inp,{style:{width:220},placeholder:"Cerca...",value:q,onChange:setQ,"aria-label":"Cerca utente"}),h("button",{className:"btn p sm",onClick:openNew},"+ Nuovo utente")),
-    h("div",{className:"tbl-wrap"},h("table",{className:"tbl"},h("thead",null,h("tr",null,h("th",null,"Nome"),h("th",null,"Email"),h("th",null,"Ruolo"),h("th",null,"Servizi assegnati"),h("th",null,"Ultimo accesso"),h("th",null,"Stato"),h("th",null))),h("tbody",null,list.map(function(u){return h("tr",{key:u.id},h("td",{style:{fontWeight:600}},u.nome),h("td",{className:"small"},u.email),h("td",null,h(Badge,{k:"ruolo"},u.ruolo==="admin"?"Amministratore":u.ruolo==="niv"?"NIV":"Servizio")),h("td",{className:"small"},(u.servizi||[]).join(", ")||"-"),h("td",{className:"small"},u.lastLogin?fmtDate(u.lastLogin):"-"),h("td",null,h(Badge,{k:u.attivo===false?"da_integrare":"validata"},u.attivo===false?"Disattivato":"Attivo")),h("td",null,h("div",{className:"row",style:{gap:4}},h("button",{className:"btn xs",onClick:function(){setM(clone(u));setPwd("");setErr("")}},"Modifica"),DB.mode==="firebase"?h("button",{className:"btn xs",onClick:async function(){try{toast(await AUTH.resetPasswordEmail(u.email))}catch(e){toast(e.message,"err")}}},"Email ripristino"):null,u.id!==p.user.id?h("button",{className:"btn xs d",onClick:async function(){if(!confirm("Eliminare l'utente "+u.nome+"?"))return;try{await DB.remove("users",u.id);toast("Utente eliminato")}catch(e){toast(e.message,"err")}}},"Elimina"):null)))}))))),
-    DB.mode==="firebase"?h("div",{style:{marginTop:10}},h(Alert,{k:"info"},"Con Firebase l'eliminazione rimuove il profilo applicativo; l'account di autenticazione va rimosso dalla console Firebase (Authentication). La password degli altri utenti si reimposta con l'email di ripristino.")):null,
+    h("div",{className:"tbl-wrap"},h("table",{className:"tbl"},h("thead",null,h("tr",null,h("th",null,"Nome"),h("th",null,"Email"),h("th",null,"Ruolo"),h("th",null,"Servizi assegnati"),h("th",null,"Ultimo accesso"),h("th",null,"Stato"),h("th",null))),h("tbody",null,list.map(function(u){return h("tr",{key:u.id},h("td",{style:{fontWeight:600},title:DB.mode==="firebase"?"UID: "+u.id:""},u.nome),h("td",{className:"small"},u.email),h("td",null,h(Badge,{k:"ruolo"},u.ruolo==="admin"?"Amministratore":u.ruolo==="niv"?"NIV":"Servizio")),h("td",{className:"small"},(u.servizi||[]).join(", ")||"-"),h("td",{className:"small"},u.lastLogin?fmtDate(u.lastLogin):"-"),h("td",null,h(Badge,{k:u.attivo===false?"da_integrare":"validata"},u.attivo===false?"Disattivato":"Attivo")),h("td",null,h("div",{className:"row",style:{gap:4}},h("button",{className:"btn xs",onClick:function(){setM(clone(u));setPwd("");setErr("")}},"Modifica"),DB.mode==="firebase"?h("button",{className:"btn xs",onClick:async function(){try{toast(await AUTH.resetPasswordEmail(u.email))}catch(e){toast(e.message,"err")}}},"Email ripristino"):null,u.id!==p.user.id?h("button",{className:"btn xs d",onClick:async function(){if(!confirm("Eliminare l'utente "+u.nome+"?"))return;try{await DB.remove("users",u.id);toast("Utente eliminato")}catch(e){toast(e.message,"err")}}},"Elimina"):null)))}))))),
+    DB.mode==="firebase"?h("div",{style:{marginTop:10}},h(Alert,{k:"info"},"Ogni utenza richiede sia l'account in Firebase Authentication sia il profilo qui elencato (documento della raccolta «utenti» con identificativo uguale all'UID dell'account): creandola da questa pagina vengono predisposti entrambi. Un account creato solo dalla console Firebase riceve invece l'errore «Missing or insufficient permissions» finché non gli si associa il profilo. L'eliminazione rimuove il profilo applicativo; l'account di autenticazione va rimosso dalla console Firebase (Authentication). La password degli altri utenti si reimposta con l'email di ripristino.")):null,
     m?h(Modal,{title:m.id?"Modifica utente":"Nuovo utente",onClose:function(){setM(null)},footer:[h("button",{key:"a",className:"btn g",onClick:function(){setM(null)}},"Annulla"),h("button",{key:"b",className:"btn p",onClick:salva},"Salva")]},
       err?h("div",{style:{marginBottom:10}},h(Alert,{k:"err"},err)):null,
       h(Field,{label:"Nome e cognome",req:true},h(Inp,{value:m.nome,onChange:function(v){setM(Object.assign({},m,{nome:v}))}})),
+      m.id&&DB.mode==="firebase"?h(Field,{label:"UID dell'account Firebase",help:"Identificativo del documento in «utenti»: deve coincidere con l'UID mostrato in Authentication."},h(Inp,{value:m.id,disabled:true})):null,
       h(Field,{label:"Email istituzionale",req:true},h(Inp,{type:"email",value:m.email,disabled:!!m.id&&DB.mode==="firebase",onChange:function(v){setM(Object.assign({},m,{email:v}))}})),
       h(Field,{label:"Ruolo",req:true},h(Radio,{name:"ruolo",value:m.ruolo,options:[["utente","Servizio (Direttore / delegato)"],["niv","Nucleo Indipendente di Valutazione"],["admin","Amministratore"]],onChange:function(v){setM(Object.assign({},m,{ruolo:v}))}})),
       m.ruolo==="utente"?h(Field,{label:"Servizi di competenza",req:true,help:"Un Direttore o un delegato può avere più Servizi (es. incarichi ad interim)."},h("div",{style:{maxHeight:220,overflow:"auto",border:"1px solid var(--pa-line)",borderRadius:4,padding:8}},areeAttive().map(function(a){return h("div",{key:a.code},h("div",{className:"small",style:{fontWeight:700,margin:"6px 0 2px",color:"var(--pa-primary-darker)"}},a.code+" - "+a.name),a.svcs.map(function(s){var on=(m.servizi||[]).indexOf(s.code)>=0;return h("label",{key:s.code,style:{display:"flex",gap:8,alignItems:"flex-start",fontSize:13,padding:"3px 0",cursor:"pointer"}},h("input",{type:"checkbox",checked:on,style:{marginTop:2},onChange:function(){var arr=on?m.servizi.filter(function(x){return x!==s.code}):(m.servizi||[]).concat([s.code]);setM(Object.assign({},m,{servizi:arr}))}}),h("span",null,h("span",{className:"mono"},s.code)," ",s.name))}))}))):null,

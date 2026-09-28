@@ -218,7 +218,7 @@ table.tbl textarea{min-height:36px}
    ════════════════════════════════════════════════════════════════════════ */
 window.APP_CONFIG = window.APP_CONFIG || {
   backend: "firebase",
-  version: "1.1.1",
+  version: "1.1.2",
   ente: "Regione Molise",
   struttura: "Direzione Generale della Giunta Regionale - Servizio di Supporto al Direttore Generale",
   ufficio: "Ufficio Programmazione strategica - Performance organizzativa - Coordinamento controlli interni - Controllo Strategico",
@@ -710,7 +710,19 @@ window.DECLARATORIE={"PR.PN.02":{"rif":"A.1","titolo":"SERVIZIO DI GABINETTO DEL
     },
     async updateUser(u){ var c=Object.assign({},u); if(DB.mode==="firebase") delete c.pwdHash; return DB.upsert("users",c) },
     async setPassword(id,pwd){
-      if(DB.mode==="firebase"){ var me=FB.auth.currentUser; if(me&&me.uid===id){await me.updatePassword(pwd);return} throw new Error("Su Firebase la password di un altro utente si reimposta inviando l'email di ripristino.") }
+      if(DB.mode==="firebase"){
+        var me=FB.auth.currentUser;
+        if(me&&me.uid===id){
+          try{ await me.updatePassword(pwd) }
+          catch(e){
+            if(e&&e.code==="auth/requires-recent-login") throw new Error("Per motivi di sicurezza Firebase richiede un accesso recente: uscire, rientrare e riprovare subito dopo.");
+            if(e&&e.code==="auth/weak-password") throw new Error("Password troppo debole: usarne una di almeno 6 caratteri.");
+            throw new Error(e.message||"Modifica non riuscita.");
+          }
+          return;
+        }
+        throw new Error("Su Firebase la password di un altro utente non è modificabile dall'applicazione: inviare l'email di ripristino oppure impostarla dalla console (Authentication - Users - Modifica utente).");
+      }
       var u=DB.state.users.find(function(x){return x.id===id}); if(!u) throw new Error("Utente non trovato");
       var c=Object.assign({},u,{pwdHash:await window.hashPwd(pwd),pwdChangedAt:nowIso()}); await DB.upsert("users",c); if(AUTH.user&&AUTH.user.id===id)AUTH.user=c;
     },
@@ -1304,6 +1316,7 @@ function Header(p){
       h("span",{className:"row",style:{gap:10}},
         h("span",{className:"pill",title:st.lastSync?"Ultimo aggiornamento "+st.lastSync.toLocaleTimeString("it-IT"):""},h("span",{className:"dot "+dot}),st.mode==="local"?"Dati locali":st.mode==="firebase"?"Firebase":"SharePoint",st.syncing?" · sincronizzazione":""),
         u?h("span",{className:"small"},u.nome," ",h(Badge,{k:"ruolo"},u.ruolo==="admin"?"Amministratore":u.ruolo==="niv"?"NIV":"Servizio")):null,
+        u?h("button",{className:"btn xs",style:{background:"transparent",color:"#fff",borderColor:"rgba(255,255,255,.5)"},title:"Cambia la tua password",onClick:p.onPwd},"Password"):null,
         u?h("button",{className:"btn xs",style:{background:"transparent",color:"#fff",borderColor:"rgba(255,255,255,.5)"},onClick:p.onLogout},"Esci"):null)),
     h("div",{className:"hdr-center"},window.LOGO_SM&&window.LOGO_SM.indexOf("data:")===0?h("img",{src:window.LOGO_SM,alt:"Regione Molise"}):null,
       h("div",null,h("div",{className:"t1"},"Graduazione dei Servizi e delle posizioni dirigenziali"),h("div",{className:"t2"},"Piattaforma metodologica correlata alle funzioni e alle responsabilità dirigenziali - D.G.R. n. 100 del 13 aprile 2026"))),
@@ -1332,6 +1345,24 @@ function Login(p){
       DB.mode==="local"?h("div",{className:"alert info",style:{marginTop:14,fontSize:12.5}},h("div",null,h("b",null,"Modalità dimostrativa (dati nel browser)."),h("br"),"Amministratore: admin@regione.molise.it / Molise2026!",h("br"),"NIV: niv@regione.molise.it / Niv2026!",h("br"),"Servizio (DG.01): direttore.demo@regione.molise.it / Demo2026!")):null
     ))
   );
+}
+
+function PwdModal(p){
+  var _a=useState(""),p1=_a[0],setP1=_a[1]; var _b=useState(""),p2=_b[0],setP2=_b[1];
+  var _e=useState(""),err=_e[0],setErr=_e[1]; var _w=useState(false),busy=_w[0],setBusy=_w[1];
+  var salva=async function(){
+    setErr("");
+    if(p1.length<6){ setErr("La password deve avere almeno 6 caratteri."); return }
+    if(p1!==p2){ setErr("Le due password non coincidono."); return }
+    setBusy(true);
+    try{ await AUTH.setPassword(p.user.id,p1); toast("Password aggiornata"); p.onClose() }
+    catch(e){ setErr(e.message) } finally{ setBusy(false) }
+  };
+  return h(Modal,{title:"Cambia la tua password",onClose:p.onClose,footer:[h("button",{key:"a",className:"btn g",onClick:p.onClose},"Annulla"),h("button",{key:"b",className:"btn p",disabled:busy,onClick:salva},busy?"Salvataggio...":"Aggiorna")]},
+    h("p",{className:"small muted",style:{marginBottom:12}},"Utenza: ",h("b",null,p.user.email),". Sostituire la password provvisoria ricevuta dall'amministratore con una personale di almeno 6 caratteri."),
+    err?h("div",{style:{marginBottom:10}},h(Alert,{k:"err"},err)):null,
+    h(Field,{label:"Nuova password",req:true},h(Inp,{type:"password",autoComplete:"new-password",value:p1,onChange:setP1})),
+    h(Field,{label:"Ripeti la nuova password",req:true},h(Inp,{type:"password",autoComplete:"new-password",value:p2,onChange:setP2,onKeyDown:function(e){if(e.key==="Enter")salva()}})));
 }
 
 /* ── home utente (Direttore / delegato) ── */
@@ -1674,7 +1705,7 @@ function Utenti(p){
       h(Field,{label:"Email istituzionale",req:true},h(Inp,{type:"email",value:m.email,disabled:!!m.id&&DB.mode==="firebase",onChange:function(v){setM(Object.assign({},m,{email:v}))}})),
       h(Field,{label:"Ruolo",req:true},h(Radio,{name:"ruolo",value:m.ruolo,options:[["utente","Servizio (Direttore / delegato)"],["niv","Nucleo Indipendente di Valutazione"],["admin","Amministratore"]],onChange:function(v){setM(Object.assign({},m,{ruolo:v}))}})),
       m.ruolo==="utente"?h(Field,{label:"Servizi di competenza",req:true,help:"Un Direttore o un delegato può avere più Servizi (es. incarichi ad interim)."},h("div",{style:{maxHeight:220,overflow:"auto",border:"1px solid var(--pa-line)",borderRadius:4,padding:8}},areeAttive().map(function(a){return h("div",{key:a.code},h("div",{className:"small",style:{fontWeight:700,margin:"6px 0 2px",color:"var(--pa-primary-darker)"}},a.code+" - "+a.name),a.svcs.map(function(s){var on=(m.servizi||[]).indexOf(s.code)>=0;return h("label",{key:s.code,style:{display:"flex",gap:8,alignItems:"flex-start",fontSize:13,padding:"3px 0",cursor:"pointer"}},h("input",{type:"checkbox",checked:on,style:{marginTop:2},onChange:function(){var arr=on?m.servizi.filter(function(x){return x!==s.code}):(m.servizi||[]).concat([s.code]);setM(Object.assign({},m,{servizi:arr}))}}),h("span",null,h("span",{className:"mono"},s.code)," ",s.name))}))}))):null,
-      h(Field,{label:m.id?"Nuova password (lasciare vuoto per non modificare)":"Password iniziale",req:!m.id,help:DB.mode==="firebase"&&m.id?"Su Firebase usare l'email di ripristino per gli altri utenti.":"Almeno 6 caratteri. Comunicarla all'utente in modo sicuro."},h(Inp,{type:"text",value:pwd,autoComplete:"new-password",disabled:DB.mode==="firebase"&&!!m.id&&m.id!==p.user.id,onChange:setPwd})),
+      h(Field,{label:m.id?"Nuova password (lasciare vuoto per non modificare)":"Password iniziale",req:!m.id,help:DB.mode==="firebase"&&m.id?"Su Firebase la password di un'utenza esistente si cambia con l'email di ripristino oppure dalla console (Authentication - Users - Modifica utente).":"Almeno 6 caratteri. Comunicarla all'utente, che potrà sostituirla dal pulsante «Password» in alto a destra."},h(Inp,{type:"text",value:pwd,autoComplete:"new-password",disabled:DB.mode==="firebase"&&!!m.id&&m.id!==p.user.id,onChange:setPwd})),
       h("label",{style:{display:"flex",gap:8,alignItems:"center",cursor:"pointer"}},h("input",{type:"checkbox",checked:m.attivo!==false,onChange:function(e){setM(Object.assign({},m,{attivo:e.target.checked}))}}),"Utenza attiva")):null);
 }
 
@@ -1735,6 +1766,7 @@ function App(){
   var _v=useState("home"),view=_v[0],setView=_v[1];
   var _ctx=useState(null),ctx=_ctx[0],setCtx=_ctx[1]; // {scheda, editable} | {svc}
   var _toast=useState(null),tst=_toast[0],setTst=_toast[1];
+  var _pw=useState(false),showPwd=_pw[0],setShowPwd=_pw[1];
   useEffect(function(){
     window.toastFn=function(m,t){setTst({m:m,t:t});setTimeout(function(){setTst(null)},3200)};
     var off=DB.onChange(function(){setTick(function(x){return x+1})});
@@ -1762,7 +1794,8 @@ function App(){
   else if(view==="imp"&&user.ruolo==="admin") body=h(Impostazioni,{user:user});
   else if(view==="guida") body=h(Guida,{user:user});
   else body=h(Dashboard,{openScheda:openScheda,openVal:openVal});
-  return h(Fragment,null,h(Header,{user:user,view:view==="scheda"?(user&&user.ruolo==="utente"?"home":"schede"):view==="valform"?"val":view,go:go,onLogout:logout}),
+  return h(Fragment,null,h(Header,{user:user,view:view==="scheda"?(user&&user.ruolo==="utente"?"home":"schede"):view==="valform"?"val":view,go:go,onLogout:logout,onPwd:function(){setShowPwd(true)}}),
+    showPwd&&user?h(PwdModal,{user:user,onClose:function(){setShowPwd(false)}}):null,
     DB.error&&user&&DB.mode!=="local"?h("div",{style:{maxWidth:1180,margin:"12px auto 0",padding:"0 20px"}},h(Alert,{k:"err"},"Problema di sincronizzazione: "+DB.error)):null,
     h("main",null,body),h(Footer,null),tst?h("div",{className:"toast "+tst.t,role:"status"},tst.m):null);
 }

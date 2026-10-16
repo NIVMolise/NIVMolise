@@ -218,7 +218,7 @@ table.tbl textarea{min-height:36px}
    ════════════════════════════════════════════════════════════════════════ */
 window.APP_CONFIG = window.APP_CONFIG || {
   backend: "firebase",
-  version: "1.1.2",
+  version: "1.2.0",
   ente: "Regione Molise",
   struttura: "Direzione Generale della Giunta Regionale - Servizio di Supporto al Direttore Generale",
   ufficio: "Ufficio Programmazione strategica - Performance organizzativa - Coordinamento controlli interni - Controllo Strategico",
@@ -229,7 +229,8 @@ window.APP_CONFIG = window.APP_CONFIG || {
   projectId: "graduazione-molise",
   storageBucket: "graduazione-molise.firebasestorage.app",
   messagingSenderId: "796904117074",
-  appId: "1:796904117074:web:8587229d384fb5f901208b"
+  appId: "1:796904117074:web:8587229d384fb5f901208b",
+  adminEndpoint: ""   // opzionale: URL della Cloud Function per impostare la password di utenze gia' esistenti
   },
   sharepoint: {
     siteUrl: "",            // es. https://tenant.sharepoint.com/sites/graduazione ; vuoto = sito corrente
@@ -412,6 +413,13 @@ window.DECLARATORIE={"PR.PN.02":{"rif":"A.1","titolo":"SERVIZIO DI GABINETTO DEL
   var nowIso = function(){return new Date().toISOString()};
   window.uid = uid; window.nowIso = nowIso;
 
+  // Password provvisoria pronunciabile, facile da dettare al telefono
+  window.generaPassword=function(){
+    var cons="bcdfglmnprstv", voc="aeiou", s="";
+    for(var i=0;i<3;i++){ s+=cons.charAt(Math.floor(Math.random()*cons.length))+voc.charAt(Math.floor(Math.random()*voc.length)) }
+    return s.charAt(0).toUpperCase()+s.slice(1)+"-"+String(Math.floor(Math.random()*9000)+1000);
+  };
+
   // SHA-256 (WebCrypto) con ripiego per contesti non sicuri
   window.hashPwd = async function(pwd){
     var s = "grs|" + (pwd||"");
@@ -495,7 +503,7 @@ window.DECLARATORIE={"PR.PN.02":{"rif":"A.1","titolo":"SERVIZIO DI GABINETTO DEL
     stopWatch(){ this.unsubs.forEach(function(u){try{u()}catch(e){}}); this.unsubs=[]; },
     watch(user){
       var self=this; this.stopWatch();
-      var staff = user.ruolo==="admin"||user.ruolo==="niv";
+      var staff = user.ruolo==="admin"||user.ruolo==="niv", role=user.ruolo;
       function sub(q, coll, transform){
         var u=q.onSnapshot(function(snap){
           var arr=[]; snap.forEach(function(d){arr.push(Object.assign({id:d.id},d.data()))});
@@ -509,7 +517,8 @@ window.DECLARATORIE={"PR.PN.02":{"rif":"A.1","titolo":"SERVIZIO DI GABINETTO DEL
       if(staff){
         sub(self.col("schede"),"schede");
         sub(self.col("valutazioni"),"valutazioni");
-        sub(self.col("users"),"users");
+        // l'anagrafica completa serve solo all'amministratore (contiene le password provvisorie)
+        if(role==="admin") sub(self.col("users"),"users"); else DB.state.users=[user];
       } else {
         var codes=(user.servizi||[]).slice(0,30);
         if(codes.length) sub(self.col("schede").where("serviceCode","in",codes),"schede"); else DB.state.schede=[];
@@ -653,7 +662,13 @@ window.DECLARATORIE={"PR.PN.02":{"rif":"A.1","titolo":"SERVIZIO DI GABINETTO DEL
     async login(email,pwd){
       email=(email||"").trim().toLowerCase();
       if(DB.mode==="firebase"){
-        var cred=await FB.auth.signInWithEmailAndPassword(email,pwd);
+        var cred=null, t=(pwd||"").trim();
+        try{ cred=await FB.auth.signInWithEmailAndPassword(email,pwd) }
+        catch(e){
+          var riprova=t!==pwd&&t.length>=6&&/invalid-credential|wrong-password/.test((e&&e.code)||"");
+          if(!riprova) throw new Error(AUTH._authErr(e));
+          try{ cred=await FB.auth.signInWithEmailAndPassword(email,t) }catch(e2){ throw new Error(AUTH._authErr(e2)) }
+        }
         var u=await AUTH._fbProfile(cred.user);
         if(!u) throw new Error(AUTH._msgPermessi(cred.user,"profilo assente nella raccolta «utenti»"));
         if(u.attivo===false) throw new Error("Utenza disattivata.");
@@ -662,10 +677,31 @@ window.DECLARATORIE={"PR.PN.02":{"rif":"A.1","titolo":"SERVIZIO DI GABINETTO DEL
       var u2=DB.state.users.find(function(x){return (x.email||"").toLowerCase()===email});
       if(!u2) throw new Error("Credenziali non valide.");
       if(u2.attivo===false) throw new Error("Utenza disattivata. Contattare l'amministratore.");
-      var h=await window.hashPwd(pwd);
-      if(u2.pwdHash!==h) throw new Error("Credenziali non valide.");
+      var h=await window.hashPwd(pwd), tl=(pwd||"").trim();
+      if(u2.pwdHash!==h){
+        var h2=tl!==pwd?await window.hashPwd(tl):null;
+        if(!h2||u2.pwdHash!==h2) throw new Error("Email o password non corretti. Verificare di non aver copiato spazi prima o dopo la password.");
+      }
       AUTH.user=u2; try{sessionStorage.setItem(SESSION_KEY,JSON.stringify({id:u2.id}))}catch(e){}
       AUTH._touch(u2); return u2;
+    },
+    // Firebase restituisce lo stesso codice per password errata, account inesistente
+    // e utenza disabilitata (protezione contro l'enumerazione degli indirizzi).
+    _authErr(e){
+      var c=(e&&e.code)||"", M={
+        "auth/invalid-credential":"Email o password non corretti. Verificare di non aver copiato spazi prima o dopo la password. Se le credenziali sono appena state comunicate dall'amministratore e l'errore persiste, l'account di accesso potrebbe non essere mai stato creato: segnalarlo all'amministratore.",
+        "auth/wrong-password":"Password non corretta. Usare «Password dimenticata?» per riceverne una nuova via email.",
+        "auth/user-not-found":"Nessun account di accesso risulta registrato con questa email. Chiedere all'amministratore di creare l'utenza.",
+        "auth/invalid-email":"Indirizzo email non valido.",
+        "auth/user-disabled":"Utenza disabilitata in Firebase Authentication. Riattivarla dalla console (Authentication - Users).",
+        "auth/too-many-requests":"Troppi tentativi non riusciti: Firebase ha temporaneamente sospeso gli accessi da questo dispositivo. Attendere qualche minuto oppure reimpostare la password via email.",
+        "auth/network-request-failed":"Connessione non riuscita: verificare la rete e che il dominio del sito sia autorizzato in Firebase (Authentication - Settings - Domini autorizzati).",
+        "auth/operation-not-allowed":"L'accesso con email e password non risulta abilitato in Firebase (Authentication - Sign-in method).",
+        "auth/weak-password":"Password troppo debole: usarne una di almeno 6 caratteri.",
+        "auth/email-already-in-use":"Esiste già un account di accesso con questa email.",
+        "auth/requires-recent-login":"Per motivi di sicurezza Firebase richiede un accesso recente: uscire, rientrare e riprovare subito dopo."
+      };
+      return M[c]||((e&&e.message)||"Operazione non riuscita.");
     },
     async _fbProfile(fbUser){
       // L'account di Firebase Authentication dice CHI è l'utente; il profilo nella
@@ -695,36 +731,103 @@ window.DECLARATORIE={"PR.PN.02":{"rif":"A.1","titolo":"SERVIZIO DI GABINETTO DEL
     _touch(u){ try{ var c=Object.assign({},u,{lastLogin:nowIso()}); DB.upsert("users",c).catch(function(){}) }catch(e){} },
     async logout(){ AUTH.user=null; try{sessionStorage.removeItem(SESSION_KEY)}catch(e){} if(DB.mode==="firebase"){FB.stopWatch();try{await FB.auth.signOut()}catch(e){}} DB.emit() },
     async createUser(u,pwd){
-      u=Object.assign({attivo:true,servizi:[],createdAt:nowIso()},u); u.email=(u.email||"").trim().toLowerCase();
+      u=Object.assign({attivo:true,servizi:[],createdAt:nowIso()},u); u.email=(u.email||"").trim().toLowerCase(); pwd=(pwd||"").trim();
       if(!u.email||!u.nome) throw new Error("Nome ed email sono obbligatori.");
       if(DB.state.users.some(function(x){return x.email===u.email&&x.id!==u.id})) throw new Error("Esiste già un utente con questa email.");
       if(DB.mode==="firebase"){
         if(!pwd||pwd.length<6) throw new Error("La password iniziale deve avere almeno 6 caratteri.");
         var name="secondary"+Date.now(); var app2=firebase.initializeApp(C.firebase,name);
-        try{ var cred=await app2.auth().createUserWithEmailAndPassword(u.email,pwd); u.id=cred.user.uid; await app2.auth().signOut() } finally { await app2.delete() }
-        delete u.pwdHash; return DB.upsert("users",u);
+        try{ var cred=await app2.auth().createUserWithEmailAndPassword(u.email,pwd); u.id=cred.user.uid; await app2.auth().signOut() }
+        catch(e){ throw new Error(AUTH._authErr(e)) }
+        finally { await app2.delete() }
+        delete u.pwdHash; u.pwdProvvisoria=pwd; u.pwdProvvisoriaAt=nowIso(); return DB.upsert("users",u);
       }
-      u.id=u.id||("u_"+uid()); if(pwd){u.pwdHash=await window.hashPwd(pwd)}
+      u.id=u.id||("u_"+uid()); if(pwd){u.pwdHash=await window.hashPwd(pwd); u.pwdProvvisoria=pwd; u.pwdProvvisoriaAt=nowIso()}
       if(!u.pwdHash) throw new Error("Impostare una password iniziale.");
       return DB.upsert("users",u);
     },
-    async updateUser(u){ var c=Object.assign({},u); if(DB.mode==="firebase") delete c.pwdHash; return DB.upsert("users",c) },
+    async updateUser(u){
+      var c=Object.assign({},u); if(DB.mode==="firebase") delete c.pwdHash;
+      var vecchio=(DB.state.users||[]).find(function(x){return x.id===u.id});
+      if(vecchio&&vecchio.pwdProvvisoria&&!c.pwdProvvisoria){ c.pwdProvvisoria=vecchio.pwdProvvisoria; c.pwdProvvisoriaAt=vecchio.pwdProvvisoriaAt }
+      return DB.upsert("users",c);
+    },
+    // Cambio della propria password: da quel momento la provvisoria dell'amministratore non vale più
+    async _dimenticaProvvisoria(id){
+      var p=(DB.state.users||[]).find(function(x){return x.id===id}); if(!p) return;
+      var c=Object.assign({},p,{pwdChangedAt:nowIso()}); delete c.pwdProvvisoria; delete c.pwdProvvisoriaAt;
+      try{ await DB.upsert("users",c); if(AUTH.user&&AUTH.user.id===id) AUTH.user=c }catch(e){}
+    },
     async setPassword(id,pwd){
+      pwd=(pwd||"").trim();
+      if(pwd.length<6) throw new Error("La password deve avere almeno 6 caratteri.");
       if(DB.mode==="firebase"){
         var me=FB.auth.currentUser;
         if(me&&me.uid===id){
-          try{ await me.updatePassword(pwd) }
-          catch(e){
-            if(e&&e.code==="auth/requires-recent-login") throw new Error("Per motivi di sicurezza Firebase richiede un accesso recente: uscire, rientrare e riprovare subito dopo.");
-            if(e&&e.code==="auth/weak-password") throw new Error("Password troppo debole: usarne una di almeno 6 caratteri.");
-            throw new Error(e.message||"Modifica non riuscita.");
-          }
+          try{ await me.updatePassword(pwd) }catch(e){ throw new Error(AUTH._authErr(e)) }
+          await AUTH._dimenticaProvvisoria(id);
           return;
         }
-        throw new Error("Su Firebase la password di un altro utente non è modificabile dall'applicazione: inviare l'email di ripristino oppure impostarla dalla console (Authentication - Users - Modifica utente).");
+        throw new Error("La password di un altro utente si imposta dal pulsante «Credenziali» nell'elenco utenti.");
       }
       var u=DB.state.users.find(function(x){return x.id===id}); if(!u) throw new Error("Utente non trovato");
-      var c=Object.assign({},u,{pwdHash:await window.hashPwd(pwd),pwdChangedAt:nowIso()}); await DB.upsert("users",c); if(AUTH.user&&AUTH.user.id===id)AUTH.user=c;
+      var c=Object.assign({},u,{pwdHash:await window.hashPwd(pwd),pwdChangedAt:nowIso()});
+      delete c.pwdProvvisoria; delete c.pwdProvvisoriaAt;
+      await DB.upsert("users",c); if(AUTH.user&&AUTH.user.id===id)AUTH.user=c;
+    },
+
+    /* Impostazione della password da parte dell'amministratore.
+       Le password non sono leggibili: Firebase le conserva solo come impronta
+       crittografica. L'amministratore puo' pero' assegnarne una nuova e,
+       finche' l'utente non la sostituisce, rileggerla da qui.
+       Lato applicazione Firebase consente di creare un account ma non di
+       cambiare la password di uno esistente: in quel caso servono l'email di
+       ripristino, la console, oppure il servizio amministrativo opzionale
+       (Cloud Function) indicato in APP_CONFIG.firebase.adminEndpoint. */
+    async adminSetPassword(user,pwd){
+      pwd=(pwd||"").trim();
+      if(pwd.length<6) throw new Error("La password deve avere almeno 6 caratteri.");
+      var segna=async function(uid2){
+        var doc=Object.assign({},user,{id:uid2||user.id,pwdProvvisoria:pwd,pwdProvvisoriaAt:nowIso()});
+        delete doc.pwdChangedAt;
+        if(DB.mode==="firebase") delete doc.pwdHash; else doc.pwdHash=await window.hashPwd(pwd);
+        await DB.upsert("users",doc);
+        if(uid2&&user.id&&uid2!==user.id){ try{ await DB.remove("users",user.id) }catch(e){} }
+        return doc;
+      };
+      // la propria password non viene conservata in chiaro: la si conosce gia'
+      if(AUTH.user&&AUTH.user.id===user.id){ await AUTH.setPassword(user.id,pwd); return {esito:"impostata",msg:"La tua password e' stata aggiornata."} }
+      if(DB.mode!=="firebase"){ await segna(null); return {esito:"impostata",msg:"Password impostata."} }
+
+      // 1) servizio amministrativo (Cloud Function con Admin SDK), se configurato
+      var ep=(C.firebase&&C.firebase.adminEndpoint)||"";
+      if(ep){
+        var tok=await FB.auth.currentUser.getIdToken(), out=null;
+        var r=await fetch(ep,{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+tok},body:JSON.stringify({uid:user.id,email:user.email,password:pwd})});
+        try{ out=await r.json() }catch(e){}
+        if(!r.ok) throw new Error("Servizio amministrativo: "+((out&&(out.error||out.message))||("errore "+r.status)));
+        await segna(out&&out.uid?out.uid:null);
+        return {esito:"impostata",msg:"Password impostata tramite il servizio amministrativo."};
+      }
+
+      // 2) la propria password
+      var me=FB.auth.currentUser;
+      if(me&&me.uid===user.id){ try{ await me.updatePassword(pwd) }catch(e){ throw new Error(AUTH._authErr(e)) } await segna(null); return {esito:"impostata",msg:"Password aggiornata."} }
+
+      // 3) l'account potrebbe non esistere: si prova a crearlo con la password indicata
+      var nome="adm"+Date.now()+Math.floor(Math.random()*1000), app2=firebase.initializeApp(C.firebase,nome), nuovo=null, errore=null;
+      try{ var cred=await app2.auth().createUserWithEmailAndPassword(user.email,pwd); nuovo=cred.user.uid; await app2.auth().signOut() }
+      catch(e){ errore=e }
+      finally{ try{ await app2.delete() }catch(e){} }
+      if(errore){
+        if(errore.code==="auth/email-already-in-use"){
+          var ex=new Error("L'account di accesso di "+user.email+" esiste gia' in Firebase Authentication. Per ragioni di sicurezza Firebase non consente a un'applicazione di sovrascrivere la password di un account altrui: inviare all'utente l'email di ripristino, oppure impostarla dalla console Firebase (Authentication - Users - menu ... - Modifica utente). Per farlo direttamente da qui occorre attivare il servizio amministrativo descritto nella guida.");
+          ex.code="esistente"; throw ex;
+        }
+        throw new Error(AUTH._authErr(errore));
+      }
+      await segna(nuovo);
+      return {esito:"creata",msg:"L'account di accesso non esisteva in Firebase Authentication ed e' stato creato ora con la password indicata"+(user.id&&user.id!==nuovo?"; il profilo e' stato riallineato al nuovo identificativo":"")+"."};
     },
     async resetPasswordEmail(email){
       if(DB.mode==="firebase"){ await FB.auth.sendPasswordResetEmail((email||"").trim().toLowerCase()); return "Email di ripristino inviata a "+email }
@@ -1690,14 +1793,106 @@ function Graduazione(p){
 }
 
 /* ── utenti ── */
+function copiaTesto(t,ok){
+  var fine=function(){ toast(ok||"Copiato negli appunti") };
+  var ripiego=function(){
+    try{ var ta=document.createElement("textarea"); ta.value=t; ta.style.position="fixed"; ta.style.opacity="0";
+      document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta); fine() }
+    catch(e){ toast("Copia non riuscita: selezionare il testo manualmente","err") }
+  };
+  try{ if(navigator.clipboard&&navigator.clipboard.writeText){ navigator.clipboard.writeText(t).then(fine,ripiego); return } }catch(e){}
+  ripiego();
+}
+
+/* ── Credenziali di un utente (riservato all'amministratore) ───────────── */
+function CredModal(p){
+  var u=p.user;
+  var _p=useState(""),pwd=_p[0],setPwd=_p[1];
+  var _m=useState(null),msg=_m[0],setMsg=_m[1];
+  var _b=useState(false),busy=_b[0],setBusy=_b[1];
+  var _f=useState(false),esistente=_f[0],setEsistente=_f[1];
+  var prov=u.pwdProvvisoria||"";
+  var indirizzo=location.origin+location.pathname;
+  var messaggio=function(pw){
+    return "Gentile "+(u.nome||"")+",\n\ndi seguito le credenziali per accedere alla piattaforma per la graduazione dei Servizi regionali (D.G.R. n. 100 del 13 aprile 2026):\n\n"+
+      "Indirizzo: "+indirizzo+"\nUtente: "+u.email+"\nPassword provvisoria: "+pw+"\n\n"+
+      "Al primo accesso si raccomanda di sostituire la password con una personale, dal pulsante «Password» in alto a destra.\n\n"+
+      window.APP_CONFIG.struttura;
+  };
+  var imposta=async function(){
+    setMsg(null); setEsistente(false); setBusy(true);
+    try{ var r=await AUTH.adminSetPassword(u,pwd); setPwd(""); setMsg({k:"ok",t:r.msg+" La password resta visibile in questa pagina finché l'utente non la sostituisce."}) }
+    catch(e){ setMsg({k:"err",t:e.message}); if(e.code==="esistente") setEsistente(true) }
+    finally{ setBusy(false) }
+  };
+  var ripristino=async function(){
+    setMsg(null);
+    try{ setMsg({k:"ok",t:await AUTH.resetPasswordEmail(u.email)}) }catch(e){ setMsg({k:"err",t:e.message}) }
+  };
+  return h(Modal,{title:"Credenziali di "+u.nome,onClose:p.onClose,footer:[h("button",{key:"c",className:"btn g",onClick:p.onClose},"Chiudi")]},
+    h("div",{className:"evid",style:{marginBottom:14}},
+      h("span",{className:"k"},"Utente"),h("span",{className:"v"},u.email),
+      h("span",{className:"k"},"Ruolo"),h("span",{className:"v"},u.ruolo==="admin"?"Amministratore":u.ruolo==="niv"?"NIV":"Servizio"),
+      h("span",{className:"k"},"Ultimo accesso"),h("span",{className:"v"},u.lastLogin?fmtDate(u.lastLogin):"mai"),
+      DB.mode==="firebase"?h("span",{className:"k"},"UID"):null,DB.mode==="firebase"?h("span",{className:"v",style:{fontSize:11}},u.id):null),
+
+    prov?h("div",{className:"alert warn",style:{display:"block",marginBottom:14}},
+        h("div",{style:{fontWeight:700,marginBottom:6}},"Password provvisoria in uso"),
+        h("div",{className:"row",style:{gap:8,marginBottom:8}},
+          h("code",{className:"mono",style:{fontSize:16,fontWeight:700,background:"#fff",border:"1px solid var(--pa-line)",padding:"6px 12px",borderRadius:4,letterSpacing:"0.5px"}},prov),
+          h("button",{className:"btn sm",onClick:function(){copiaTesto(prov,"Password copiata")}},"Copia password"),
+          h("button",{className:"btn sm",onClick:function(){copiaTesto(messaggio(prov),"Messaggio copiato: incollarlo nella email per l'utente")}},"Copia messaggio per l'utente")),
+        h("div",{className:"small"},"Assegnata il ",fmtDate(u.pwdProvvisoriaAt),". Resta leggibile finché l'utente non la sostituisce con una personale."))
+      :(u.pwdChangedAt?h("div",{className:"alert ok",style:{marginBottom:14}},h("div",null,"L'utente ha impostato una password personale il ",fmtD(u.pwdChangedAt),". Non è leggibile da nessuno, nemmeno dall'amministratore: se l'ha dimenticata, assegnarne una nuova qui sotto."))
+        :h("div",{className:"alert info",style:{marginBottom:14}},h("div",null,"Nessuna password provvisoria registrata per questa utenza."))),
+
+    h(Field,{label:"Assegna una nuova password",help:"Almeno 6 caratteri. Dopo l'assegnazione resta visibile qui, così da poterla comunicare all'utente."},
+      h("div",{className:"row"},
+        h(Inp,{style:{flex:1,minWidth:180},type:"text",value:pwd,autoComplete:"new-password",placeholder:"es. "+(window._pwdEsempio||(window._pwdEsempio=generaPassword())),onChange:setPwd,onKeyDown:function(e){if(e.key==="Enter"&&pwd.trim().length>=6)imposta()}}),
+        h("button",{className:"btn sm",onClick:function(){setPwd(generaPassword())}},"Genera"),
+        h("button",{className:"btn p sm",disabled:busy||pwd.trim().length<6,onClick:imposta},busy?"Attendere...":"Assegna"))),
+
+    msg?h("div",{style:{margin:"10px 0"}},h(Alert,{k:msg.k},msg.t)):null,
+
+    esistente?h("div",{className:"card",style:{marginTop:10}},h("div",{className:"card-b"},
+      h("div",{style:{fontWeight:700,marginBottom:8,fontSize:14}},"Come procedere"),
+      h("ol",{style:{margin:"0 0 10px 18px",fontSize:13.5,lineHeight:1.6}},
+        h("li",null,"Inviare all'utente l'email di ripristino: sceglierà da sé la password, senza che debba transitare per email o chat."),
+        h("li",null,"Oppure impostarla dalla console Firebase: Authentication → Users → menu ⋮ sulla riga dell'utente → Modifica utente → campo Password."),
+        h("li",null,"Per assegnarla direttamente da questa pagina, attivare il servizio amministrativo descritto nella guida (richiede il piano Blaze di Firebase).")),
+      h("button",{className:"btn",onClick:ripristino},"Invia email di ripristino"))):null,
+
+    !esistente?h("div",{className:"row",style:{marginTop:12}},
+      DB.mode==="firebase"?h("button",{className:"btn sm",onClick:ripristino},"Invia email di ripristino"):null,
+      h("span",{className:"spacer"}),
+      h("button",{className:"btn sm g",onClick:function(){copiaTesto(u.email,"Email copiata")}},"Copia email")):null,
+
+    h("div",{className:"small muted",style:{marginTop:14,lineHeight:1.5,borderTop:"1px solid var(--pa-line-soft)",paddingTop:10}},
+      "Le password non sono leggibili: vengono conservate solo come impronta crittografica, come prescritto dalle misure di sicurezza del GDPR (art. 32). Quella mostrata sopra è la password provvisoria assegnata dall'amministratore, conservata in chiaro soltanto finché l'utente non la sostituisce."));
+}
+
 function Utenti(p){
   var users=DB.state.users||[], _m=useState(null),m=_m[0],setM=_m[1], _pwd=useState(""),pwd=_pwd[0],setPwd=_pwd[1], _err=useState(""),err=_err[0],setErr=_err[1], _q=useState(""),q=_q[0],setQ=_q[1];
+  var _cr=useState(null),cred=_cr[0],setCred=_cr[1], _vd=useState(false),vedi=_vd[0],setVedi=_vd[1];
   var list=users.filter(function(u){return !q||(u.nome+" "+u.email+" "+(u.servizi||[]).join(" ")).toLowerCase().indexOf(q.toLowerCase())>=0}).sort(function(a,b){return (a.ruolo+a.nome)<(b.ruolo+b.nome)?-1:1});
   var openNew=function(){setM({nome:"",email:"",ruolo:"utente",servizi:[],attivo:true});setPwd("");setErr("")};
-  var salva=async function(){setErr("");try{ if(m.id){await AUTH.updateUser(m); if(pwd){await AUTH.setPassword(m.id,pwd)} toast("Utente aggiornato")} else {await AUTH.createUser(m,pwd); toast("Utente creato")} setM(null) }catch(e){setErr(e.message)}};
-  return h("div",null,h("div",{className:"card"},h("div",{className:"card-h"},h("h2",null,"Utenti e ruoli"),h("span",{className:"spacer"}),h(Inp,{style:{width:220},placeholder:"Cerca...",value:q,onChange:setQ,"aria-label":"Cerca utente"}),h("button",{className:"btn p sm",onClick:openNew},"+ Nuovo utente")),
-    h("div",{className:"tbl-wrap"},h("table",{className:"tbl"},h("thead",null,h("tr",null,h("th",null,"Nome"),h("th",null,"Email"),h("th",null,"Ruolo"),h("th",null,"Servizi assegnati"),h("th",null,"Ultimo accesso"),h("th",null,"Stato"),h("th",null))),h("tbody",null,list.map(function(u){return h("tr",{key:u.id},h("td",{style:{fontWeight:600},title:DB.mode==="firebase"?"UID: "+u.id:""},u.nome),h("td",{className:"small"},u.email),h("td",null,h(Badge,{k:"ruolo"},u.ruolo==="admin"?"Amministratore":u.ruolo==="niv"?"NIV":"Servizio")),h("td",{className:"small"},(u.servizi||[]).join(", ")||"-"),h("td",{className:"small"},u.lastLogin?fmtDate(u.lastLogin):"-"),h("td",null,h(Badge,{k:u.attivo===false?"da_integrare":"validata"},u.attivo===false?"Disattivato":"Attivo")),h("td",null,h("div",{className:"row",style:{gap:4}},h("button",{className:"btn xs",onClick:function(){setM(clone(u));setPwd("");setErr("")}},"Modifica"),DB.mode==="firebase"?h("button",{className:"btn xs",onClick:async function(){try{toast(await AUTH.resetPasswordEmail(u.email))}catch(e){toast(e.message,"err")}}},"Email ripristino"):null,u.id!==p.user.id?h("button",{className:"btn xs d",onClick:async function(){if(!confirm("Eliminare l'utente "+u.nome+"?"))return;try{await DB.remove("users",u.id);toast("Utente eliminato")}catch(e){toast(e.message,"err")}}},"Elimina"):null)))}))))),
+  var salva=async function(){setErr("");try{
+    if(m.id){ await AUTH.updateUser(m); if(pwd.trim()){ var r=await AUTH.adminSetPassword(m,pwd); toast(r.msg) } else toast("Utente aggiornato") }
+    else { await AUTH.createUser(m,pwd); toast("Utente creato: la password resta visibile nell'elenco") }
+    setM(null) }catch(e){setErr(e.message)}};
+  return h("div",null,h("div",{className:"card"},h("div",{className:"card-h"},h("h2",null,"Utenti e ruoli"),h("span",{className:"spacer"}),h(Inp,{style:{width:200},placeholder:"Cerca...",value:q,onChange:setQ,"aria-label":"Cerca utente"}),
+    h("label",{style:{display:"flex",gap:6,alignItems:"center",fontSize:13,cursor:"pointer"},title:"Mostra in chiaro le password provvisorie"},h("input",{type:"checkbox",checked:vedi,onChange:function(e){setVedi(e.target.checked)}}),"Mostra password"),
+    h("button",{className:"btn p sm",onClick:openNew},"+ Nuovo utente")),
+    h("div",{className:"tbl-wrap"},h("table",{className:"tbl"},h("thead",null,h("tr",null,h("th",null,"Nome"),h("th",null,"Email"),h("th",null,"Ruolo"),h("th",null,"Servizi assegnati"),h("th",null,"Password"),h("th",null,"Ultimo accesso"),h("th",null,"Stato"),h("th",null))),h("tbody",null,list.map(function(u){return h("tr",{key:u.id},h("td",{style:{fontWeight:600},title:DB.mode==="firebase"?"UID: "+u.id:""},u.nome),h("td",{className:"small"},u.email),h("td",null,h(Badge,{k:"ruolo"},u.ruolo==="admin"?"Amministratore":u.ruolo==="niv"?"NIV":"Servizio")),h("td",{className:"small"},(u.servizi||[]).join(", ")||"-"),
+      h("td",{className:"small"},u.pwdProvvisoria?h("span",{className:"row",style:{gap:5,flexWrap:"nowrap"}},
+          h("code",{className:"mono",style:{background:"var(--pa-warning-bg)",color:"var(--pa-warning)",padding:"1px 7px",borderRadius:3,fontWeight:700,letterSpacing:vedi?"0.3px":"2px"}},vedi?u.pwdProvvisoria:"\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"),
+          h("button",{className:"btn xs g",title:"Copia la password",onClick:function(){copiaTesto(u.pwdProvvisoria,"Password di "+u.nome+" copiata")}},"Copia"))
+        :(u.pwdChangedAt?h("span",{className:"muted",title:"Password personale impostata il "+fmtD(u.pwdChangedAt)},"personale"):h("span",{className:"muted"},"-"))),
+      h("td",{className:"small"},u.lastLogin?fmtDate(u.lastLogin):"-"),h("td",null,h(Badge,{k:u.attivo===false?"da_integrare":"validata"},u.attivo===false?"Disattivato":"Attivo")),h("td",null,h("div",{className:"row",style:{gap:4}},h("button",{className:"btn xs",onClick:function(){setM(clone(u));setPwd("");setErr("")}},"Modifica"),
+      h("button",{className:"btn xs p",title:"Vedi e imposta la password",onClick:function(){setCred(u.id)}},"Credenziali"),u.id!==p.user.id?h("button",{className:"btn xs d",onClick:async function(){if(!confirm("Eliminare l'utente "+u.nome+"?"))return;try{await DB.remove("users",u.id);toast("Utente eliminato")}catch(e){toast(e.message,"err")}}},"Elimina"):null)))}))))),
+    h("div",{style:{marginTop:10}},h(Alert,{k:"warn"},h("div",null,h("b",null,"Password. ")," Le password non sono leggibili: il sistema ne conserva solo l'impronta crittografica. Dal pulsante «Credenziali» l'amministratore può assegnarne una nuova e rileggerla finché l'utente non la sostituisce con una personale; da quel momento non è più visibile a nessuno. Le password provvisorie compaiono anche nel backup JSON: conservarlo con la stessa cura delle credenziali."))),
     DB.mode==="firebase"?h("div",{style:{marginTop:10}},h(Alert,{k:"info"},"Ogni utenza richiede sia l'account in Firebase Authentication sia il profilo qui elencato (documento della raccolta «utenti» con identificativo uguale all'UID dell'account): creandola da questa pagina vengono predisposti entrambi. Un account creato solo dalla console Firebase riceve invece l'errore «Missing or insufficient permissions» finché non gli si associa il profilo. L'eliminazione rimuove il profilo applicativo; l'account di autenticazione va rimosso dalla console Firebase (Authentication). La password degli altri utenti si reimposta con l'email di ripristino.")):null,
+    cred?(function(){var cu=(DB.state.users||[]).find(function(x){return x.id===cred}); return cu?h(CredModal,{user:cu,onClose:function(){setCred(null)}}):null})():null,
     m?h(Modal,{title:m.id?"Modifica utente":"Nuovo utente",onClose:function(){setM(null)},footer:[h("button",{key:"a",className:"btn g",onClick:function(){setM(null)}},"Annulla"),h("button",{key:"b",className:"btn p",onClick:salva},"Salva")]},
       err?h("div",{style:{marginBottom:10}},h(Alert,{k:"err"},err)):null,
       h(Field,{label:"Nome e cognome",req:true},h(Inp,{value:m.nome,onChange:function(v){setM(Object.assign({},m,{nome:v}))}})),
@@ -1705,7 +1900,8 @@ function Utenti(p){
       h(Field,{label:"Email istituzionale",req:true},h(Inp,{type:"email",value:m.email,disabled:!!m.id&&DB.mode==="firebase",onChange:function(v){setM(Object.assign({},m,{email:v}))}})),
       h(Field,{label:"Ruolo",req:true},h(Radio,{name:"ruolo",value:m.ruolo,options:[["utente","Servizio (Direttore / delegato)"],["niv","Nucleo Indipendente di Valutazione"],["admin","Amministratore"]],onChange:function(v){setM(Object.assign({},m,{ruolo:v}))}})),
       m.ruolo==="utente"?h(Field,{label:"Servizi di competenza",req:true,help:"Un Direttore o un delegato può avere più Servizi (es. incarichi ad interim)."},h("div",{style:{maxHeight:220,overflow:"auto",border:"1px solid var(--pa-line)",borderRadius:4,padding:8}},areeAttive().map(function(a){return h("div",{key:a.code},h("div",{className:"small",style:{fontWeight:700,margin:"6px 0 2px",color:"var(--pa-primary-darker)"}},a.code+" - "+a.name),a.svcs.map(function(s){var on=(m.servizi||[]).indexOf(s.code)>=0;return h("label",{key:s.code,style:{display:"flex",gap:8,alignItems:"flex-start",fontSize:13,padding:"3px 0",cursor:"pointer"}},h("input",{type:"checkbox",checked:on,style:{marginTop:2},onChange:function(){var arr=on?m.servizi.filter(function(x){return x!==s.code}):(m.servizi||[]).concat([s.code]);setM(Object.assign({},m,{servizi:arr}))}}),h("span",null,h("span",{className:"mono"},s.code)," ",s.name))}))}))):null,
-      h(Field,{label:m.id?"Nuova password (lasciare vuoto per non modificare)":"Password iniziale",req:!m.id,help:DB.mode==="firebase"&&m.id?"Su Firebase la password di un'utenza esistente si cambia con l'email di ripristino oppure dalla console (Authentication - Users - Modifica utente).":"Almeno 6 caratteri. Comunicarla all'utente, che potrà sostituirla dal pulsante «Password» in alto a destra."},h(Inp,{type:"text",value:pwd,autoComplete:"new-password",disabled:DB.mode==="firebase"&&!!m.id&&m.id!==p.user.id,onChange:setPwd})),
+      h(Field,{label:m.id?"Nuova password (lasciare vuoto per non modificare)":"Password iniziale",req:!m.id,help:"Almeno 6 caratteri. Resta visibile nell'elenco utenti finché l'utente non la sostituisce dal pulsante «Password» in alto a destra."},
+        h("div",{className:"row"},h(Inp,{style:{flex:1,minWidth:160},type:"text",value:pwd,autoComplete:"new-password",onChange:setPwd}),h("button",{className:"btn sm",onClick:function(){setPwd(generaPassword())}},"Genera"))),
       h("label",{style:{display:"flex",gap:8,alignItems:"center",cursor:"pointer"}},h("input",{type:"checkbox",checked:m.attivo!==false,onChange:function(e){setM(Object.assign({},m,{attivo:e.target.checked}))}}),"Utenza attiva")):null);
 }
 
